@@ -1,5 +1,5 @@
 import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow warnings
 
 import cv2
 import numpy as np
@@ -9,16 +9,16 @@ from PIL import Image
 import io
 import hashlib
 import mysql.connector
-from datetime import datetime, time
+from datetime import datetime
 import threading
-import time as time_module
+import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from deepface import DeepFace
 
 
 class FaceRecognitionSystem:
-    def __init__(self, data_file="uploads/face_data.json", uploads_dir="uploads"):
+    def __init__(self, data_file="face_data.json", uploads_dir="uploads"):
         self.data_file = data_file
         self.uploads_dir = uploads_dir
         self.known_faces = {}
@@ -29,22 +29,16 @@ class FaceRecognitionSystem:
         )
 
         # Database configuration
-        is_railway = os.environ.get('RAILWAY_ENVIRONMENT') or os.environ.get('RAILWAY_STATIC_URL') or os.environ.get('RAILWAY_GIT_COMMIT_SHA')
-        
-        default_host = "mysql.railway.internal" if is_railway else "localhost"
-        default_pass = "eIKUyoNeEeMStYONTCowvZAzNHJbrFkv" if is_railway else ""
-
         self.db_config = {
-            'host': os.environ.get('DB_HOST', default_host),
-            'user': os.environ.get('DB_USER', 'root'),
-            'password': os.environ.get('DB_PASSWORD', default_pass),
-            'database': os.environ.get('DB_NAME', 'litoda_db'),
-            'port': int(os.environ.get('DB_PORT', 3306))
+            'host': 'localhost',
+            'user': 'root',
+            'password': '',
+            'database': 'dispatch_system'
         }
 
         # Recognition settings
         self.reload_interval = 30
-        self.similarity_threshold = 0.60
+        self.similarity_threshold = 0.60  # ArcFace ~ cosine similarity threshold
         self.last_full_reload = datetime.now()
         self.current_date = datetime.now().date()
 
@@ -85,17 +79,17 @@ class FaceRecognitionSystem:
                         self.archive_previous_day_queue()
                     
                     # Check every minute
-                    time_module.sleep(60)
+                    time.sleep(60)
                     
                 except Exception as e:
                     print(f"[DailyReset] Monitor error: {e}")
-                    time_module.sleep(60)
+                    time.sleep(60)
 
         threading.Thread(target=monitor_worker, daemon=True).start()
         print(f"[Info] Daily reset monitor started (current date: {self.current_date})")
 
     def archive_previous_day_queue(self):
-        """Optional: Archive or clean up previous day's queue"""
+        """Archive or clean up previous day's queue using queue_date"""
         conn = self.get_db_connection()
         if not conn:
             return
@@ -103,13 +97,15 @@ class FaceRecognitionSystem:
         try:
             cursor = conn.cursor()
             
-            # Update any remaining 'Onqueue' status from previous days to 'Expired'
+            today = datetime.now().date()
+            
+            # Update 'Onqueue' entries from previous days to 'Expired' using queue_date
             cursor.execute("""
                 UPDATE queue 
                 SET status = 'Expired' 
                 WHERE status = 'Onqueue' 
-                AND DATE(queued_at) < CURDATE()
-            """)
+                AND queue_date < %s
+            """, (today,))
             
             expired_count = cursor.rowcount
             conn.commit()
@@ -125,14 +121,13 @@ class FaceRecognitionSystem:
                 conn.close()
             except:
                 pass
-
     # -------------------------------
     # AUTO RELOAD THREAD
     # -------------------------------
     def start_auto_reload(self):
         def worker():
             while True:
-                time_module.sleep(self.reload_interval)
+                time.sleep(self.reload_interval)
                 try:
                     print("\n[AutoReload] Checking for updates...")
                     self.reload_all_drivers()
@@ -146,12 +141,20 @@ class FaceRecognitionSystem:
     # VALIDATE SINGLE FACE
     # -------------------------------
     def validate_single_face(self, image_data):
+        """
+        Validate that exactly one face is present in the image
+        Returns: dict with 'valid' (bool) and 'message' (str)
+        """
         try:
+            # Decode base64 image
             img_bytes = base64.b64decode(image_data.split(',')[1] if ',' in image_data else image_data)
             img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
             np_img = np.array(img)
             
+            # Convert to grayscale for face detection
             gray = cv2.cvtColor(np_img, cv2.COLOR_RGB2GRAY)
+            
+            # Detect faces using Haar Cascade
             faces = self.face_cascade.detectMultiScale(
                 gray,
                 scaleFactor=1.1,
@@ -160,6 +163,7 @@ class FaceRecognitionSystem:
             )
             
             face_count = len(faces)
+            
             print(f"[validate_single_face] Detected {face_count} face(s)")
             
             if face_count == 0:
@@ -175,12 +179,13 @@ class FaceRecognitionSystem:
                     "face_count": face_count
                 }
             else:
+                # Check if the detected face is large enough (not too far)
                 (x, y, w, h) = faces[0]
                 face_area = w * h
                 image_area = np_img.shape[0] * np_img.shape[1]
                 face_ratio = face_area / image_area
                 
-                if face_ratio < 0.05:
+                if face_ratio < 0.05:  # Face is too small (less than 5% of image)
                     return {
                         "valid": False,
                         "message": "Face is too far. Please move closer to the camera.",
@@ -239,6 +244,7 @@ class FaceRecognitionSystem:
                     samples.append(driver['profile_pic'])
 
                 if not samples:
+                    print(f"[Reload] No samples for {name}")
                     continue
 
                 for img_path in samples:
@@ -247,6 +253,7 @@ class FaceRecognitionSystem:
                         embeddings.append(emb)
 
                 if not embeddings:
+                    print(f"[Reload] No valid embeddings for {name}")
                     continue
 
                 avg_emb = np.mean(embeddings, axis=0)
@@ -270,7 +277,7 @@ class FaceRecognitionSystem:
             print(f"[reload_all_drivers] error: {e}")
 
     # -------------------------------
-    # EXTRACT FACE EMBEDDING
+    # EXTRACT FACE EMBEDDING (ArcFace)
     # -------------------------------
     def extract_embedding(self, path_or_array):
         try:
@@ -283,6 +290,7 @@ class FaceRecognitionSystem:
                 return np.array(emb[0]["embedding"], dtype=np.float32)
             return None
         except Exception as e:
+            print(f"[extract_embedding] error: {e}")
             return None
 
     # -------------------------------
@@ -326,6 +334,7 @@ class FaceRecognitionSystem:
                 }
             }
         except Exception as e:
+            print(f"[recognize_face] error: {e}")
             return {"success": False, "message": f"Recognition error: {e}"}
 
     def cosine_similarity(self, a, b):
@@ -361,6 +370,134 @@ class FaceRecognitionSystem:
             except: pass
             return None
 
+    # -------------------------------
+    # QUEUE FUNCTIONS WITH HISTORY RECORDING
+    # -------------------------------
+
+
+    def add_to_queue(self, driver_id):
+        conn = self.get_db_connection()
+        if not conn:
+            return {"success": False, "message": "DB connection failed"}
+        try:
+            cursor = conn.cursor(dictionary=True)
+            
+            # Get driver
+            cursor.execute(
+                "SELECT id, firstname, lastname, tricycle_number FROM drivers WHERE id=%s LIMIT 1",
+                (driver_id,)
+            )
+            driver = cursor.fetchone()
+            if not driver:
+                cursor.close()
+                conn.close()
+                return {"success": False, "message": "Driver not found"}
+            
+            driver_name = f"{driver['firstname']} {driver['lastname']}"
+            tricycle_number = driver.get("tricycle_number", "")
+            
+            # Check if already in queue today
+            cursor.execute("""
+                SELECT id FROM queue 
+                WHERE driver_id=%s AND status='Onqueue' AND DATE(queued_at)=CURDATE()
+            """, (driver_id,))
+            existing = cursor.fetchone()
+            
+            if existing:
+                cursor.close()
+                conn.close()
+                return {"success": False, "message": "Already in queue"}
+
+            now = datetime.now()
+
+            # Insert into queue
+            cursor.execute("""
+                INSERT INTO queue (driver_id, driver_name, tricycle_number, queued_at, status)
+                VALUES (%s, %s, %s, %s, 'Onqueue')
+            """, (driver_id, driver_name, tricycle_number, now))
+            queue_id = cursor.lastrowid
+            
+            # Insert INQUEUE event into history
+            cursor.execute("""
+                INSERT INTO history (driver_id, driver_name, tricycle_number, queue_time, queue_id)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (driver_id, driver_name, tricycle_number, now, queue_id))
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            print(f"[INQUEUE] Driver {driver_name} added to queue & saved to history")
+            return {"success": True, "message": "Added to queue & saved to history"}
+
+        except Exception as e:
+            print(f"[add_to_queue] Error: {e}")
+            try: conn.close()
+            except: pass
+            return {"success": False, "message": str(e)}
+
+   # -------------------------------
+# FIXED DISPATCH WITH CORRECT HISTORY RECORDING
+# -------------------------------
+    def dispatch_driver(self, driver_id):
+        conn = self.get_db_connection()
+        if not conn:
+            return {"success": False, "message": "DB connection failed"}
+
+        try:
+            cursor = conn.cursor(dictionary=True)
+            
+            # Get driver
+            cursor.execute(
+                "SELECT id, firstname, lastname, tricycle_number FROM drivers WHERE id=%s LIMIT 1",
+                (driver_id,)
+            )
+            driver = cursor.fetchone()
+            if not driver:
+                cursor.close()
+                conn.close()
+                return {"success": False, "message": "Driver not found"}
+
+            driver_name = f"{driver['firstname']} {driver['lastname']}"
+            tricycle_number = driver.get("tricycle_number", "")
+
+            # Find queue entry
+            cursor.execute("""
+                SELECT id FROM queue 
+                WHERE driver_id=%s AND status='Onqueue' ORDER BY queued_at ASC LIMIT 1
+            """, (driver_id,))
+            queue_entry = cursor.fetchone()
+
+            if not queue_entry:
+                cursor.close()
+                conn.close()
+                return {"success": False, "message": "Not in queue"}
+
+            queue_id = queue_entry["id"]
+
+            now = datetime.now()
+
+            # Update queue entry
+            cursor.execute("UPDATE queue SET status='Dispatched', dispatch_at=%s WHERE id=%s", (now, queue_id))
+
+            # Create DISPATCH history record
+            cursor.execute("""
+                INSERT INTO history (driver_id, driver_name, tricycle_number, dispatch_time, queue_id)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (driver_id, driver_name, tricycle_number, now, queue_id))
+
+            conn.commit()
+            cursor.close()
+            conn.close()
+
+            print(f"[DISPATCH] Driver {driver_name} dispatched & saved to history")
+            return {"success": True, "message": "Dispatched & saved to history"}
+
+        except Exception as e:
+            print(f"[dispatch_driver] Error: {e}")
+            try: conn.close()
+            except: pass
+            return {"success": False, "message": str(e)}
 
 # -------------------------------
 # FLASK API
@@ -370,48 +507,66 @@ CORS(app)
 face_system = FaceRecognitionSystem()
 
 
-@app.before_request
-def log_request_info():
-    print(f"[Flask] Request path: {request.path}", flush=True)
-
-
 @app.route('/validate_single_face', methods=['POST'])
 def validate_single_face():
+    """
+    Validate that exactly one face is present in the captured image
+    """
     try:
         data = request.json
         image_data = data.get('image')
+
         if not image_data:
             return jsonify({'valid': False, 'message': 'No image provided'}), 400
+
         result = face_system.validate_single_face(image_data)
         return jsonify(result)
+
     except Exception as e:
+        print(f"[validate_single_face] Error: {str(e)}")
         return jsonify({'valid': False, 'message': f'Error: {str(e)}'}), 500
 
 
 @app.route('/check_face_duplicate', methods=['POST'])
 def check_face_duplicate():
+    """
+    Check if the uploaded face matches any existing driver in the database
+    """
     try:
         data = request.json
         image_data = data.get('image')
+
         if not image_data:
             return jsonify({'error': 'No image provided'}), 400
 
+        print("[check_face_duplicate] Checking for duplicate faces...")
+
+        # Decode base64 image
         img_bytes = base64.b64decode(image_data.split(',')[1] if ',' in image_data else image_data)
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         np_img = np.array(img)
 
+        # Extract embedding from new image
         new_embedding = face_system.extract_embedding(np_img)
+        
         if new_embedding is None:
+            print("[check_face_duplicate] No face detected in uploaded image")
             return jsonify({'duplicate': False, 'message': 'No face detected in image'})
 
+        # Normalize embedding
         new_embedding = new_embedding / (np.linalg.norm(new_embedding) + 1e-8)
-        DUPLICATE_THRESHOLD = 0.40
+
+        # Compare with all registered drivers using the same similarity threshold
+        DUPLICATE_THRESHOLD = 0.40  # Lower threshold for duplicate detection (more strict)
         
         for driver_id, driver_data in face_system.known_faces.items():
             stored_embedding = np.array(driver_data["embedding"])
             similarity = face_system.cosine_similarity(new_embedding, stored_embedding)
             
+            print(f"[check_face_duplicate] Comparing with {driver_data['name']}: similarity = {similarity:.4f}")
+            
             if similarity >= DUPLICATE_THRESHOLD:
+                print(f"[check_face_duplicate] ✗ DUPLICATE FOUND: {driver_data['name']} (similarity: {similarity:.4f})")
                 return jsonify({
                     'duplicate': True,
                     'matched_driver': driver_data['name'],
@@ -419,9 +574,13 @@ def check_face_duplicate():
                     'driver_id': driver_data['id']
                 })
 
+        print("[check_face_duplicate] ✓ No duplicate found - new driver can be registered")
         return jsonify({'duplicate': False})
+
     except Exception as e:
+        print(f"[check_face_duplicate] Error: {str(e)}")
         return jsonify({'error': f'Error processing image: {str(e)}'}), 500
+
 
 @app.route('/check_face_match', methods=['POST'])
 def check_face_match():
@@ -476,6 +635,7 @@ def check_face_match():
         print(f"[check_face_match] Error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
+
 @app.route("/recognize", methods=["POST"])
 def recognize():
     data = request.get_json()
@@ -486,17 +646,23 @@ def recognize():
 
 @app.route('/inqueue', methods=['POST'])
 def inqueue():
-    """Add driver to queue with automatic daily reset of queue numbers"""
+    """Add driver to queue - Reports-friendly version"""
     try:
         data = request.get_json()
         driver_id = data.get('driver_id')
         
         if not driver_id:
-            return jsonify({'success': False, 'message': 'Driver ID required'}), 400
+            return jsonify({
+                'success': False,
+                'message': 'Driver ID required'
+            }), 400
         
         conn = face_system.get_db_connection()
         if not conn:
-            return jsonify({'success': False, 'message': 'Database connection failed'}), 500
+            return jsonify({
+                'success': False,
+                'message': 'Database connection failed'
+            }), 500
         
         try:
             cursor = conn.cursor(dictionary=True)
@@ -511,12 +677,19 @@ def inqueue():
             if not driver:
                 cursor.close()
                 conn.close()
-                return jsonify({'success': False, 'message': 'Driver not found'}), 404
+                return jsonify({
+                    'success': False,
+                    'message': 'Driver not found'
+                }), 404
             
             driver_name = f"{driver['firstname']} {driver['lastname']}"
             tricycle_number = driver.get("tricycle_number", "")
             
-            # Check if already in queue TODAY
+            now = datetime.now()
+            today = now.date()
+            
+            # Check if already in queue today
+            # NOTE: Still using DATE(queued_at) for compatibility with existing reports
             cursor.execute("""
                 SELECT id, queue_number FROM queue 
                 WHERE driver_id = %s 
@@ -534,27 +707,27 @@ def inqueue():
                     'queue_number': existing['queue_number']
                 }), 400
             
-            # Get next queue number FOR TODAY ONLY
-            # This automatically resets to 1 each new day
+            # Get next queue number
+            # NOTE: Using queue_date here for accuracy, but reports can still use DATE(queued_at)
             cursor.execute("""
                 SELECT COALESCE(MAX(queue_number), 0) as max_num 
                 FROM queue 
-                WHERE DATE(queued_at) = CURDATE()
-            """)
+                WHERE queue_date = %s
+            """, (today,))
             max_row = cursor.fetchone()
             next_queue_number = max_row['max_num'] + 1
             
-            now = datetime.now()
-            
             # Insert into queue
+            # IMPORTANT: Set both queued_at AND queue_date so reports work with either
             cursor.execute("""
-                INSERT INTO queue (driver_id, driver_name, tricycle_number, queue_number, queued_at, status)
-                VALUES (%s, %s, %s, %s, %s, 'Onqueue')
-            """, (driver_id, driver_name, tricycle_number, next_queue_number, now))
+                INSERT INTO queue 
+                (driver_id, driver_name, tricycle_number, queue_number, queue_date, queued_at, status)
+                VALUES (%s, %s, %s, %s, %s, %s, 'Onqueue')
+            """, (driver_id, driver_name, tricycle_number, next_queue_number, today, now))
             
             queue_id = cursor.lastrowid
             
-            # Insert into history
+            # Insert into history (NO CHANGES - reports still work)
             cursor.execute("""
                 INSERT INTO history (driver_id, driver_name, tricycle_number, queue_time, queue_id)
                 VALUES (%s, %s, %s, %s, %s)
@@ -564,7 +737,7 @@ def inqueue():
             cursor.close()
             conn.close()
             
-            print(f"[INQUEUE] Driver {driver_name} added as Queue #{next_queue_number} (Date: {now.date()})")
+            print(f"[INQUEUE] Driver {driver_name} added as Queue #{next_queue_number}")
             
             return jsonify({
                 'success': True,
@@ -572,32 +745,56 @@ def inqueue():
                 'queue_number': next_queue_number
             }), 200
             
-        except Exception as e:
-            print(f"[inqueue] Database error: {e}")
+        except mysql.connector.IntegrityError as ie:
+            print(f"[inqueue] Duplicate prevented: {ie}")
             try:
+                conn.rollback()
                 conn.close()
             except:
                 pass
-            return jsonify({'success': False, 'message': f'Database error: {str(e)}'}), 500
+            return jsonify({
+                'success': False,
+                'message': 'Queue number conflict. Please try again.'
+            }), 409
+            
+        except Exception as e:
+            print(f"[inqueue] Database error: {e}")
+            try:
+                conn.rollback()
+                conn.close()
+            except:
+                pass
+            return jsonify({
+                'success': False,
+                'message': f'Database error: {str(e)}'
+            }), 500
             
     except Exception as e:
         print(f"[inqueue] Error: {e}")
-        return jsonify({'success': False, 'message': 'Server error occurred'}), 500
-
+        return jsonify({
+            'success': False,
+            'message': 'Server error occurred'
+        }), 500
 
 @app.route('/dispatch', methods=['POST'])
 def dispatch():
-    """Dispatch driver from queue"""
+    """Dispatch driver from queue - Reports-friendly version"""
     try:
         data = request.get_json()
         driver_id = data.get('driver_id')
         
         if not driver_id:
-            return jsonify({'success': False, 'message': 'Driver ID required'}), 400
+            return jsonify({
+                'success': False,
+                'message': 'Driver ID required'
+            }), 400
         
         conn = face_system.get_db_connection()
         if not conn:
-            return jsonify({'success': False, 'message': 'Database connection failed'}), 500
+            return jsonify({
+                'success': False,
+                'message': 'Database connection failed'
+            }), 500
         
         try:
             cursor = conn.cursor(dictionary=True)
@@ -612,12 +809,16 @@ def dispatch():
             if not driver:
                 cursor.close()
                 conn.close()
-                return jsonify({'success': False, 'message': 'Driver not found'}), 404
+                return jsonify({
+                    'success': False,
+                    'message': 'Driver not found'
+                }), 404
             
             driver_name = f"{driver['firstname']} {driver['lastname']}"
             tricycle_number = driver.get("tricycle_number", "")
             
-            # Find queue entry FOR TODAY
+            # Find queue entry for TODAY
+            # NOTE: Still using DATE(queued_at) for compatibility with existing reports
             cursor.execute("""
                 SELECT id, queue_number FROM queue 
                 WHERE driver_id = %s 
@@ -631,20 +832,23 @@ def dispatch():
             if not queue_entry:
                 cursor.close()
                 conn.close()
-                return jsonify({'success': False, 'message': 'Driver not in queue'}), 400
+                return jsonify({
+                    'success': False,
+                    'message': 'Driver not in queue today'
+                }), 400
             
             queue_id = queue_entry["id"]
             queue_number = queue_entry["queue_number"]
             now = datetime.now()
             
-            # Update queue status
+            # Update queue status (NO CHANGES - reports still work)
             cursor.execute("""
                 UPDATE queue 
                 SET status = 'Dispatched', dispatch_at = %s 
                 WHERE id = %s
             """, (now, queue_id))
             
-            # Insert dispatch record
+            # Insert dispatch record into history (NO CHANGES - reports still work)
             cursor.execute("""
                 INSERT INTO history (driver_id, driver_name, tricycle_number, dispatch_time, queue_id)
                 VALUES (%s, %s, %s, %s, %s)
@@ -654,7 +858,7 @@ def dispatch():
             cursor.close()
             conn.close()
             
-            print(f"[DISPATCH] Queue #{queue_number} ({driver_name}) dispatched (Date: {now.date()})")
+            print(f"[DISPATCH] Queue #{queue_number} ({driver_name}) dispatched")
             
             return jsonify({
                 'success': True,
@@ -664,15 +868,21 @@ def dispatch():
         except Exception as e:
             print(f"[dispatch] Database error: {e}")
             try:
+                conn.rollback()
                 conn.close()
             except:
                 pass
-            return jsonify({'success': False, 'message': f'Database error: {str(e)}'}), 500
+            return jsonify({
+                'success': False,
+                'message': f'Database error: {str(e)}'
+            }), 500
             
     except Exception as e:
         print(f"[dispatch] Error: {e}")
-        return jsonify({'success': False, 'message': 'Server error occurred'}), 500
-
+        return jsonify({
+            'success': False,
+            'message': 'Server error occurred'
+        }), 500
 
 @app.route("/reload", methods=["POST"])
 def reload_drivers():
@@ -682,16 +892,152 @@ def reload_drivers():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({
-        "status": "ok", 
-        "faces_loaded": len(face_system.known_faces),
-        "current_date": str(face_system.current_date)
-    })
+    return jsonify({"status": "ok", "faces_loaded": len(face_system.known_faces), "current_date": str(face_system.current_date)})
 
+@app.route('/remove_now_serving', methods=['POST'])
+def remove_now_serving():
+    """Remove the currently serving driver (first in queue) - Requires authenticated driver"""
+    try:
+        data = request.json
+        remover_driver_id = data.get('remover_driver_id')
+        remover_driver_name = data.get('remover_driver_name')
+        
+        if not remover_driver_id or not remover_driver_name:
+            return jsonify({
+                'success': False,
+                'message': 'Authentication required'
+            }), 400
+        
+        conn = face_system.get_db_connection()
+        if not conn:
+            return jsonify({
+                'success': False,
+                'message': 'Database connection failed'
+            }), 500
+        
+        try:
+            cursor = conn.cursor(dictionary=True)
+            
+            # Get the first driver in queue (now serving)
+            cursor.execute("""
+                SELECT id, driver_id, driver_name, tricycle_number, queue_number
+                FROM queue 
+                WHERE status = 'Onqueue' 
+                AND DATE(queued_at) = CURDATE()
+                ORDER BY queued_at ASC 
+                LIMIT 1
+            """)
+            now_serving = cursor.fetchone()
+            
+            if not now_serving:
+                cursor.close()
+                conn.close()
+                return jsonify({
+                    'success': False,
+                    'message': 'No driver currently serving'
+                }), 400
+            
+            queue_id = now_serving['id']
+            removed_driver_id = now_serving['driver_id']
+            removed_driver_name = now_serving['driver_name']
+            removed_tricycle = now_serving['tricycle_number']
+            removed_queue_number = now_serving['queue_number']
+            
+            now = datetime.now()
+            
+            # Update queue status to Removed
+            cursor.execute("""
+                UPDATE queue 
+                SET status = 'Removed', dispatch_at = %s 
+                WHERE id = %s
+            """, (now, queue_id))
+            
+            # Log the removal in removal_logs table
+            cursor.execute("""
+                INSERT INTO removal_logs 
+                (driver_id, driver_name, tricycle_number, queue_number, 
+                 remover_driver_id, remover_driver_name, removed_at, reason)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                removed_driver_id, 
+                removed_driver_name, 
+                removed_tricycle, 
+                removed_queue_number,
+                remover_driver_id, 
+                remover_driver_name, 
+                now,
+                'Forgot to dispatch - Removed from Now Serving'
+            ))
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            print(f"[REMOVE_NOW_SERVING] Queue #{removed_queue_number} ({removed_driver_name}) removed by {remover_driver_name}")
+            
+            return jsonify({
+                'success': True,
+                'message': 'Driver removed from Now Serving successfully',
+                'removed_driver_name': removed_driver_name,
+                'removed_queue_number': removed_queue_number
+            }), 200
+            
+        except Exception as e:
+            print(f"[remove_now_serving] Database error: {e}")
+            try:
+                conn.rollback()
+                conn.close()
+            except:
+                pass
+            return jsonify({
+                'success': False,
+                'message': f'Database error: {str(e)}'
+            }), 500
+            
+    except Exception as e:
+        print(f"[remove_now_serving] Error: {e}")
+        return jsonify({
+            'success': False,
+            'message': 'Server error occurred'
+        }), 500
+
+@app.route('/get_removal_logs', methods=['GET'])
+def get_removal_logs():
+    """Get all removal logs, ordered by most recent"""
+    conn = face_system.get_db_connection()
+    if not conn:
+        return jsonify({'success': False, 'message': 'Database connection failed'}), 500
+    
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT 
+                driver_id,
+                driver_name, 
+                tricycle_number, 
+                queue_number,
+                remover_driver_id,
+                remover_driver_name,
+                removed_at,
+                reason
+            FROM removal_logs 
+            ORDER BY removed_at DESC 
+            LIMIT 100
+        """)
+        logs = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        return jsonify({'success': True, 'logs': logs})
+        
+    except Exception as e:
+        print(f"[get_removal_logs] Error: {e}")
+        try: conn.close()
+        except: pass
+        return jsonify({'success': False, 'message': str(e)}), 500
 
 if __name__ == "__main__":
     print(f"[Info] Loaded {len(face_system.known_faces)} driver embeddings")
     print(f"[Info] Current date: {face_system.current_date}")
-    port = int(os.environ.get("PORT", 5000))
-    print(f"[Info] Server running at: http://0.0.0.0:{port}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    print("[Info] Server running at: http://127.0.0.1:5000")
+    app.run(host="127.0.0.1", port=5000, debug=True, use_reloader=False)    
