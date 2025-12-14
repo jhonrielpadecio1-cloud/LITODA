@@ -31,12 +31,15 @@ class FaceRecognitionSystem:
         # Database configuration - USE ENVIRONMENT VARIABLES FOR HELIOHOST
         self.db_config = {
             'host': os.environ.get('DB_HOST', 'localhost'),
-            'user': os.environ.get('DB_USER', 'root'),
-            'password': os.environ.get('DB_PASSWORD', ''),
-            'database': os.environ.get('DB_NAME', 'dispatch_system'),
+            'user': os.environ.get('DB_USER', 'jhonrielpadecio0_litoda_user'),
+            'password': os.environ.get('DB_PASSWORD', 'LitodaDB#2025!'),
+            'database': os.environ.get('DB_NAME', 'jhonrielpadecio0_litoda_db'),
             'port': int(os.environ.get('DB_PORT', 3306))
         }
-
+        # HelioHost PHP API URL (fallback if direct MySQL fails)
+        self.heliohost_api = os.environ.get('HELIOHOST_API', 'https://jhonrielpadecio0.heliohost.us/api')
+        self.use_php_api = os.environ.get('USE_PHP_API', 'false').lower() == 'true'
+        
         # Recognition settings
         self.reload_interval = 30
         self.similarity_threshold = 0.60
@@ -330,9 +333,6 @@ class FaceRecognitionSystem:
             try: conn.close()
             except: pass
             return None
-
-    # Keep all your existing queue methods (add_to_queue, dispatch_driver, etc.)
-    # ... [Include all remaining methods from your original code]
 
 
 # Flask App
